@@ -1,0 +1,239 @@
+DataContext.tsx — Detailed explanation
+
+Overview
+
+DataContext.tsx is the central data layer for the app. It is responsible for loading
+and persisting user-specific food (ingredient) and symptom logs, computing inferred
+allergy patterns by matching user-entered foods to a static allergy database, and
+providing helper functions used by the UI to add/update/delete entries and query
+computed results (recent foods, daily lists, pattebrn details, elimination stats).
+
+File structure and key exports
+- Exports: `DataProvider` (React provider component) and `useData` (hook to access the
+  context value).
+- Internal: local helper functions for text normalization and fuzzy matching,
+  a `useMemo`-computed `patterns` list, and multiple utility functions that mutate
+  or query the stored ingredients/symptoms.
+
+Imports
+- Types from `@/types/allergy` are used to provide strong typing for entries,
+  patterns, and returned details.
+- `ALLERGY_DATABASE` and `AllergyDatabaseEntry` from `@/utils/allergyDatabase` supply
+  the static dataset used for matching user-entered food strings to known allergens.
+- `AsyncStorage` is used for persistent storage of per-user data.
+- React hooks: `createContext`, `useContext`, `useEffect`, `useMemo`, `useState`.
+- `useAuth` provides the current user; storage is namespaced per-user.
+
+`DataContextType` (interface)
+- Describes the shape of the context value provided by `DataProvider`.
+- Includes arrays (`ingredients`, `symptoms`, `patterns`, `safeFoods`) and many
+  helper functions for adding/updating/deleting and querying data.
+
+Creating the context
+- `const DataContext = createContext<DataContextType | undefined>(undefined);`
+  initializes the context; `useData` later enforces correct usage inside the provider.
+
+`DataProvider` component
+- Accepts `children` and returns `<DataContext.Provider value={...}>{children}</...>`.
+- Responsibilities inside the component:
+  - Manage local state for `ingredients`, `symptoms`, and `userOverrides`.
+  - Load saved state from `AsyncStorage` when a `user` appears.
+  - Persist `ingredients`, `symptoms`, and `userOverrides` back to `AsyncStorage`
+    whenever they change.
+  - Provide a suite of helper utilities and computed values to consumers.
+
+Local state
+- `ingredients: IngredientEntry[]` — user-logged foods/ingredients.
+- `symptoms: SymptomEntry[]` — user-logged symptoms.
+- `userOverrides: Record<string, 'confirmed' | 'dismissed' | 'safe'>` — manual
+  user decisions keyed by normalized allergy name; used to force a pattern to
+  `confirmed`/`dismissed`/`safe` regardless of inferred stats.
+
+Storage key helper
+- `getStorageKey(type: string)` builds a namespaced storage key in the format
+  `allergyTracker_${user?.id}_${type}`, ensuring per-user separation for
+  `ingredients`, `symptoms`, and `overrides`.
+
+Persistence and loading (useEffect blocks)
+- On mount (and when `user` changes) the provider tries to load saved JSON for
+  `ingredients`, `symptoms`, and `overrides` and populates the corresponding
+  React state arrays/objects.
+- Separate `useEffect` blocks persist `ingredients`, `symptoms`, and `userOverrides`
+  independently whenever they change (only if `user` is present).
+
+Text normalization & tokenization helpers
+- `normalizeText(value: string)`:
+  - Lowercases the input, replaces non-alphanumeric characters with spaces,
+    collapses multiple spaces and trims.
+  - Purpose: produce a comparable canonical form for fuzzy matching and token
+    extraction.
+
+- `tokenize(value: string)`:
+  - Calls `normalizeText`, splits on spaces, trims tokens, and filters out
+    very short tokens (length <= 2).
+  - Purpose: obtain meaningful word tokens for overlap matching.
+
+- `textRoughMatch(a: string, b: string)`:
+  - Loose substring-inclusion check: returns true if `a` equals `b`, or
+    one includes the other. Guards for falsy values.
+  - Purpose: allow small morphological differences like `peanut` vs `peanuts`.
+
+- `hasTokenOverlap(a: string, b: string)`:
+  - Tokenizes both inputs and checks if any token from `a` exists in `b`'s
+    token set.
+  - Purpose: match multi-word phrases like `peanut oil` vs `peanuts` by token overlap.
+
+- `splitIngredientParts(value: string)`:
+  - Splits a raw ingredient string on common separators like `,;|/`, trims parts,
+    and removes empty segments.
+  - Purpose: extract component pieces from compound ingredient lines.
+
+Matching against the static allergy database
+- `getMatchingAllergiesForFood(foodName: string)`:
+  - Accepts a free-text food/ingredient string.
+  - Builds `rawParts` by splitting on separators and `normalizedParts` which
+    includes the full normalized food name and normalized parts.
+  - Iterates every `entry` in `ALLERGY_DATABASE` and constructs `candidates`
+    from the entry's `allergy_name`, `food_causes`, and `indian_food_examples`.
+  - For each candidate, normalizes and checks if any `normalizedParts` roughly
+    match the candidate using `textRoughMatch` or `hasTokenOverlap`.
+  - Collects unique matches (one per allergy name) and returns an array of
+    `{ entry, matchedKeyword }` where `matchedKeyword` is the original candidate
+    string that produced the match (for UI hints).
+  - Purpose: map a messy user food string to one or more database allergy entries.
+
+Symptom support check
+- `isSymptomSupportedByAllergy(symptomName: string, allergyEntries: AllergyDatabaseEntry[])`:
+  - Normalizes `symptomName` and checks whether it roughly matches any of the
+    `common_symptoms` listed on any of the provided `allergyEntries`.
+  - Uses `textRoughMatch` after normalizing the common symptoms.
+  - Purpose: decide whether a particular symptom plausibly indicates a given
+    allergy entry.
+
+Time-window check (correlation window)
+- `isWithinTwentyFourHourWindow(foodDateTime: Date, symptomDateTime: Date)`:
+  - Computes the difference in hours between symptom and food timestamps.
+  - Returns false if the symptom occurs before the food (negative diff).
+  - Returns true if the symptom occurred within 24 hours after the food.
+  - Purpose: restrict correlation to a biologically plausible post-meal window
+    (changed from 8h to 24h in this version).
+
+Pattern computation (`patterns`) — useMemo
+- `patterns` is computed with `useMemo` and depends on `[ingredients, symptoms, userOverrides]`.
+- Algorithm summary:
+  1. Build an `allergyMap` keyed by normalized allergy name. Each value tracks:
+     - `total`: count of ingredient entries that matched this allergy.
+     - `reactions`: number of those meals that had at least one linked symptom
+       within the time window and matching the allergy's symptom list.
+     - `linkedSymptoms`: set of symptom names linked to this allergy.
+     - `basedOnEntries`: set of food strings that led to matches (for UI examples).
+     - `matchedKeywords`: set of keywords from the DB that matched the foods.
+  2. Group `symptoms` by date into `symptomsByDate` for efficient per-meal checks.
+  3. For each `ingredient` entry:
+     - Get matching allergy entries via `getMatchingAllergiesForFood`.
+     - Parse the ingredient datetime and collect candidate symptoms for that date.
+     - For each matched allergy entry, increment `total`, record `basedOnEntries`
+       and keyword, then check the candidate symptoms for an 24-hour match and
+       symptom support. If any symptom satisfies both checks for this meal,
+       mark `hadReactionForThisMeal` and add symptom name to `linkedSymptoms`.
+     - After checking candidate symptoms for that meal, if any reaction occurred,
+       increment `reactions` for that allergy in the map.
+  4. Convert `allergyMap` into an array of `AllergyPattern` objects. For each
+     map entry compute:
+     - `triggerScore`: rounded percentage `reactions / total * 100`.
+     - `status`: honor `userOverrides` (`confirmed`/`dismissed`/`safe`) or fall
+       back to `safe` if there are zero reactions; otherwise `suspected`.
+     - `advisoryMessage`, `linkedSymptoms`, `basedOnEntries`, `matchedKeywords`.
+
+- Purpose: produce a compact list of inferred allergy patterns the UI can
+  surface, with counts and example evidence.
+
+`safeFoods`
+- Derived by filtering `patterns` where the `status === 'safe'`.
+- Purpose: provides a list of foods/allergy names that appear non-reactive.
+
+Simple query utils
+- `getTodayStats()`:
+  - Returns `{ foodsLogged, symptomsLogged }` for the current date.
+- `getEliminationStats()`:
+  - If no symptoms exist returns `{ symptomFreeDays: 0, lastSymptomDate: null }`.
+  - Finds the most recent symptom datetime, calculates whole-day difference from
+    today's start, and returns `symptomFreeDays` and ISO string of `lastSymptomDate`.
+  - Purpose: support elimination tracking screens.
+
+CRUD helpers for ingredients & symptoms
+- `addIngredient(entry)`:
+  - Adds a new `IngredientEntry` with `id: Date.now().toString()` and default
+    `source: 'manual'` if not provided.
+- `updateIngredient(id, updates)`:
+  - Maps over `ingredients` and merges updates into the matching entry.
+- `deleteIngredient(id)`:
+  - Filters out the ingredient with the given `id`.
+- `addSymptom(entry)` / `updateSymptom(id, updates)` / `deleteSymptom(id)`:
+  - Parallel operations for symptom entries; `addSymptom` sets `id` similarly.
+
+User override helpers
+- `confirmPattern(food)`, `dismissPattern(food)`, `markFoodSafe(food)`:
+  - Set `userOverrides[normalizedFood]` to `'confirmed' | 'dismissed' | 'safe'`.
+  - Keys are stored normalized (lowercased) to align with pattern keys.
+  - Purpose: allow the user to manually override the inference engine.
+
+Date-based queries
+- `getIngredientsForDate(date)` and `getSymptomsForDate(date)`
+  - Simple filters returning entries with `entry.date === date`.
+
+Recent foods and symptom linking
+- `getRecentFoods(hours)`:
+  - Converts entries to datetimes and keeps those whose timestamp is within the
+    last `hours` (compares now - when <= cutoffMs).
+  - Returns results sorted descending by time and mapped back to `IngredientEntry`.
+- `linkSymptomToRecentFoods(symptomId, hours = 24)`:
+  - Gathers recent foods (default window 24 hours) and updates the symptom with
+    a `linkedIngredients` array of food names.
+  - Purpose: let the UI link a symptom with foods eaten recently.
+
+Detailed pattern view
+- `getAllergyPatternDetails(allergyName)` returns `AllergyPatternDetails | null`:
+  - Normalizes `allergyName` and tries to find a `basePattern` in the computed
+    `patterns` or `safeFoods` arrays.
+  - Iterates through all `ingredients`, finds those that match the normalized
+    allergy via `getMatchingAllergiesForFood`, and builds `linkedEntries` with
+    evidence: ingredient text, date/time, matched keyword, allergy name.
+  - For each matched ingredient, it also checks symptoms within the 24-hour
+    window and whether the symptom is supported by the allergy; matching
+    symptoms are accumulated in `linkedSymptomsMap`.
+  - If no `basePattern` and no linked entries exist, returns `null` (no data).
+  - Otherwise it assembles a full details object including `entries` (sorted
+    newest-first), `symptoms` (sorted), `matchedKeywords`, and basic counts.
+  - Purpose: supply the pattern details screen with the evidence and context
+    behind an inferred or confirmed allergy label.
+
+Returned provider value
+- The context value exposes:
+  - `ingredients`, `symptoms`
+  - `patterns`: only non-`safe` patterns that are either `confirmed` or have
+    at least two recorded reactions (`reactionCount >= 2`) — this reduces
+    noise on the home screen by hiding single-correlation suspects.
+  - `safeFoods`, and all helper functions described above.
+
+`useData` hook
+- Convenience wrapper that reads the `DataContext` and throws an error if used
+  outside the `DataProvider`.
+
+Notes and rationale
+- Time window: changed from 8 hours to 24 hours to capture longer-delayed
+  reactions; controlled by `isWithinTwentyFourHourWindow` and used in both the
+  pattern computation and pattern-detail logic.
+- Fuzzy matching: uses both substring checks and token-overlap to be robust
+  against minor differences in how users log ingredients versus DB entries.
+- Overrides and UI filtering: user overrides allow manual correction, and the
+  `patterns` value returned to UI filters out weak signals (single correlations)
+  unless the user explicitly confirms a pattern.
+
+Where to look next
+- `utils/allergyDatabase.ts` — to understand what the static allergy entries
+  contain (fields like `allergy_name`, `food_causes`, `common_symptoms`).
+- `types/allergy.ts` — the precise shapes of `IngredientEntry`, `SymptomEntry`,
+  `AllergyPattern`, and `AllergyPatternDetails` referenced throughout this file.
+
+End of explanation

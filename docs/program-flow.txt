@@ -1,0 +1,183 @@
+Allersense — Program Flow (Technical)
+
+1. Overview
+
+This document describes the runtime flow and architecture of the Allersense
+application (React Native / Expo + TypeScript). It focuses on the control/data
+flows, storage keys, main components, and the allergy-pattern inference
+algorithm so engineers can reason about behavior and extend the app.
+
+2. App Startup
+
+- Entry point: Expo Router uses `app/_layout.tsx` which composes providers:
+  - `QueryClientProvider` (react-query) — currently no heavy usage but available
+  - `SafeAreaProvider` — safe area handling
+  - `ThemeProvider` — supplies theme name and color palette (`contexts/ThemeContext.tsx`)
+  - `AuthProvider` — manages current user session and auth APIs (`contexts/AuthContext.tsx`)
+  - `DataProvider` — loads user data (ingredients, symptoms, overrides) (`contexts/DataContext.tsx`)
+- After providers mount, the router resolves the initial route to `app/index.tsx`.
+  - `index.tsx` (`app/index.tsx`) uses `useAuth()` to check `isLoading` and `user`.
+  - If loading: show placeholder; if user present redirect to `/home` else `/onboarding`.
+
+3. Theme Handling (`contexts/ThemeContext.tsx`)
+
+- Theme is a small context with `theme: 'light'|'dark'`, `colors` map,
+  `setTheme()` and `toggleTheme()`.
+- User theme preference persisted under AsyncStorage key: `allersense_theme`.
+- Consumers call `useTheme()` to obtain `colors` and style the UI.
+
+4. Authentication Flow (`contexts/AuthContext.tsx`)
+
+- This app uses a local, mock authentication stored in AsyncStorage (demo only).
+- Keys:
+  - `USERS_KEY = 'allergyTracker_users'` — JSON array of StoredUser objects
+  - `CURRENT_USER_KEY = 'allergyTracker_user'` — JSON of the logged-in User (no password)
+- Public API from `useAuth()`:
+  - `user: User | null` — current session (no password)
+  - `isLoading: boolean` — initial load state
+  - `login(email, password)` — checks saved users and sets `CURRENT_USER_KEY`
+  - `signup(name, email, password)` — creates StoredUser with generated id and saves
+  - `logout()` — clears `CURRENT_USER_KEY`
+  - `updateProfile(updates)` — merges updates into current user and updates both `CURRENT_USER_KEY` and `USERS_KEY`
+  - `createTemporaryTestProfile(profileType)` — seeds demo user data (ingredients/symptoms/overrides) for testing
+- Notes: Passwords are stored in local storage for demo purposes — replace with secure backend in production.
+
+5. Data Layer (`contexts/DataContext.tsx`)
+
+- Purpose: load/store per-user food and symptom logs and provide operations + pattern inference.
+- Storage keys are user-scoped by prefixing with `allergyTracker_${user.id}_<type>`.
+  - `<type>` values: `ingredients`, `symptoms`, `overrides`
+- State held in context:
+  - `ingredients: IngredientEntry[]` — each entry includes `id`, `foodName`, `date`, `time`, `source` (manual/scanned)
+  - `symptoms: SymptomEntry[]` — each includes `id`, `symptomName`, `date`, `time`, `severity`, optional `linkedIngredients`
+  - `userOverrides: Record<string, 'confirmed'|'dismissed'|'safe'>` — user decisions for inferred patterns
+- Exposed functions include add/update/delete for ingredients and symptoms, utility queries (getTodayStats, getEliminationStats, getRecentFoods, linkSymptomToRecentFoods, getAllergyPatternDetails) and pattern override handlers (confirmPattern, dismissPattern, markFoodSafe).
+- Persistence: useEffect hooks serialize the arrays back to AsyncStorage whenever they change.
+
+6. Ingredient / Symptom Logging Flows
+
+-- Adding an ingredient (UI screens: `app/(app)/ingredients.tsx`, `app/(app)/scanner.tsx`):
+  1. UI gathers `foodName`, `date`, `time` and `source`
+  2. `addIngredient()` generates `id = Date.now().toString()`, saves to `ingredients` state
+  3. Ingredients for that user serialized to `allergyTracker_${id}_ingredients` key
+
+-- Adding a symptom (UI: `app/(app)/symptoms.tsx`):
+  1. UI chooses a symptom (from aggregated list built from `ALLERGY_DATABASE`), severity, time, optional notes
+  2. `addSymptom()` creates symptom entry with `id` and optional `linkedIngredients` (recent foods)
+  3. Saved to `allergyTracker_${id}_symptoms` key
+
+7. Scanner Flow (`app/(app)/scanner.tsx`)
+
+- User may take/upload a photo; OCR is not integrated — scan is simulated.
+- Simulated scanner parses free-text into a list of ingredient strings (one per line or separated by commas/semicolons).
+- After parsing, user can edit the detected ingredients and confirm; each confirmed ingredient becomes an `IngredientEntry` with `source: 'scanned'`.
+- The scanner also cross-checks known user allergens (simple substring checks) to show warnings.
+
+8. Allergy Database (`utils/allergyDatabase.ts`)
+
+- Static list of `AllergyDatabaseEntry` objects with fields:
+  - `allergy_name`, `common_symptoms[]`, `food_causes[]`, `indian_food_examples[]`
+- Used by DataContext to match user-entered ingredient text to possible allergies, and to populate common symptom picker.
+
+9. Pattern Inference Algorithm (core, in `contexts/DataContext.tsx`)
+
+High-level objective: infer associations between logged foods and symptoms using text matching and temporal proximity.
+
+Steps (detailed):
+
+1) Preprocessing & helpers:
+   - `normalizeText(value)` — lowercases, removes non-alphanumeric chars (except spaces), collapses whitespace.
+   - `tokenize(value)` — runs normalizeText and splits into tokens, filters out tokens of length <= 2.
+   - `textRoughMatch(a, b)` — quick match: equality or substring inclusion.
+   - `hasTokenOverlap(a, b)` — tokenized overlap test (handles multi-word matches).
+   - `splitIngredientParts(value)` — split an ingredient line on `, ; | /` to get parts for more granular matching.
+
+2) Matching a food string to database entries (`getMatchingAllergiesForFood(foodName)`):
+   - For each DB entry, gather candidate strings: `entry.allergy_name`, `entry.food_causes[]`, `entry.indian_food_examples[]`.
+   - Normalize the foodName and its parts, then for each candidate, perform matching using `textRoughMatch` or token overlap.
+   - If any candidate matches, the DB entry is returned with the matched keyword.
+
+3) Correlating foods and symptoms:
+   - Build a date-indexed map of symptoms to reduce search domain.
+   - For each logged ingredient entry:
+     - Obtain matched allergies via `getMatchingAllergiesForFood`.
+     - For candidate symptoms on the same date, convert the times to Date objects and check whether symptom time is within 8 hours after the food time (`isWithinEightHourWindow`).
+     - Confirm if the symptom name appears in `entry.common_symptoms` (using normalized comparison) via `isSymptomSupportedByAllergy`.
+     - For each allergy key, track counters:
+       - `total` (how many times the food was consumed)
+       - `reactions` (how many of those had a linked symptom within 8 hours)
+       - `linkedSymptoms` set and `basedOnEntries` set
+
+4) Compute `triggerScore` per allergy = round(reactions / total * 100).
+
+5) Apply user overrides (`userOverrides`) which may set status to 'confirmed', 'dismissed' or 'safe'. Otherwise infer status:
+   - `safe` if reactions === 0
+   - `suspected` default
+
+6) The result is a `patterns` array with details: `food`, `triggerScore`, `reactionCount`, `totalConsumed`, `linkedSymptoms`, `basedOnEntries`, `matchedKeywords`, `status`, `advisoryMessage`.
+
+Notes on algorithmic design choices:
+- Matching is intentionally permissive (substring & token overlap) to handle noisy user input.
+- Temporal window is conservative (8 hours) which is typical to capture delayed food reactions.
+- Scoring is simple frequency-based; this approach is explainable but not statistically rigorous — for production, consider building probabilistic models or using more advanced NLP.
+
+10. UI Integration
+
+- `Home` shows patterns (non-safe ones) and safe foods separately. Each pattern card allows user overrides (Confirm / Dismiss / Mark Safe) which update `userOverrides`.
+ - `AllergyPattern` detail page (`app/allergy-pattern.tsx`) uses `getAllergyPatternDetails(allergyName)` to gather linked ingredient entries and symptom instances, sorted by date/time.
+ - `Symptoms` screen (`app/(app)/symptoms.tsx`) optionally links a new symptom to recent foods (via `getRecentFoods(hours)`) and stores `linkedIngredients` inside the symptom entry.
+ - `Ingredients` screen (`app/(app)/ingredients.tsx`) shows per-day logs and supports editing / deleting entries.
+
+11. Data Types (high level)
+
+- IngredientEntry: { id: string; foodName: string; date: yyyy-MM-dd; time: hh:mm (24h); source: 'manual'|'scanned' }
+- SymptomEntry: { id: string; symptomName: string; severity: number; date: yyyy-MM-dd; time: hh:mm; notes?: string; suspectedFood?: string; linkedIngredients?: string[] }
+- AllergyPattern (inferred): { food, triggerScore, reactionCount, totalConsumed, symptomFreeCount, status, advisoryMessage, linkedSymptoms[], basedOnEntries[], matchedKeywords[] }
+
+12. Demo / Test Data
+
+- `createTemporaryTestProfile(profileType)` seeds a StoredUser and writes three keys for that demo id:
+  - `allergyTracker_<demoId>_ingredients`
+  - `allergyTracker_<demoId>_symptoms`
+  - `allergyTracker_<demoId>_overrides`
+- Demo profiles use consistent IDs and known allergens to make UI flows predictable for testing.
+
+13. Important Files and Their Roles
+
+ - `app/_layout.tsx` — provider composition and themed Stack
+ - `contexts/AuthContext.tsx` — mock auth, session persistence, demo seed
+ - `contexts/DataContext.tsx` — central data layer, persistence, pattern inference
+ - `contexts/ThemeContext.tsx` — theme palette and storage
+ - `utils/allergyDatabase.ts` — static allergy entries used for matching
+ - App screens (paths):
+   - `app/auth.tsx` — authentication/login/signup screen
+   - `app/onboarding.tsx` — onboarding flow
+   - `app/disclaimer.tsx` — disclaimer screen
+   - `app/profile-setup.tsx` — initial profile setup
+   - `app/allergy-setup.tsx` — alternate allergy setup
+   - `app/allergy-pattern.tsx` — pattern detail view
+   - `app/(app)/home.tsx` — main dashboard after login
+   - `app/(app)/ingredients.tsx` — ingredients list & editor
+   - `app/(app)/symptoms.tsx` — symptoms list & editor
+   - `app/(app)/scanner.tsx` — ingredient list scanner/ocr UI (simulated)
+   - `app/(app)/profile.tsx` — user profile
+
+14. Production Considerations & Next Steps
+
+- Replace local auth and password storage with a secure backend and proper hashing.
+- Consider storing data in a sync-capable backend (e.g., REST + DB) rather than AsyncStorage.
+- Improve matching using improved NLP (lemmatization, fuzzy matching, synonyms) or ML models.
+- Add unit and integration tests around the pattern inference logic and database matching.
+- Add input sanitization & limits on free-text inputs to reduce noisy matches.
+
+Appendix: Quick reference of AsyncStorage keys
+
+- allersense_theme
+- allergyTracker_users
+- allergyTracker_user
+- allergyTracker_<userId>_ingredients
+- allergyTracker_<userId>_symptoms
+- allergyTracker_<userId>_overrides
+
+
+End of document.
