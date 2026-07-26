@@ -140,3 +140,31 @@ AllerSense is an educational project and is **not a medical diagnostic tool**. A
 Developed for a **College Innovation Competition**.
 
 ⭐ If you like the project, consider starring the repository!
+
+# 🩺 AllerSense
+
+<p align="center">
+  <img src="assets/logo.png" width="180">
+</p>
+
+---
+
+## 📱 Screenshots
+
+
+### Home Screen
+
+<img src="assets/home.jpeg" width="250">
+<img src="assets/dark.jpeg" width="250">
+
+### Food Diary
+
+<img src="assets/food.jpeg" width="250">
+
+### Symptoms
+
+<img src="assets/symptoms.jpeg" width="250">
+
+### Insights
+
+<img src="assets/details.png" width="250">
