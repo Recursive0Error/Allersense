@@ -167,4 +167,4 @@ Developed for a **College Innovation Competition**.
 
 ### Insights
 
-<img src="assets/details.png" width="250">
+<img src="assets/details.jpeg" width="250">
